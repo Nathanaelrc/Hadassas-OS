@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# Post-install script for Debian 13 (Trixie) Netinstall
+# Purpose:
+# - Update system
+# - Set system language to Spanish (prefer Chile es_CL.UTF-8; fallback es_ES.UTF-8)
+# - Set keyboard layout to Spanish Latin American (latam) for console
+# - Install KDE Plasma (standard), SDDM (Wayland by default)
+# - Install LibreOffice (Spanish), Synaptic
+# - Install tools: FileZilla, Remmina (+RDP/VNC), VLC, htop, btop
+# - Install Brave browser (official repo)
+# - Branding/hostname: "Hadassa OS"
+# - Force Wayland by default (not X11) in SDDM/KDE
+# - Set root password to 'root' and create user 'live' with password 'live' (sudo enabled)
+#
+# Usage: sudo bash postinstall_debian_trixie_hadassa_wayland_users.txt
+
+set -euo pipefail
+
+#----- Helper -----#
+require_root() {
+  if [[ $EUID -ne 0 ]]; then
+    echo "Please run this script as root (e.g., sudo bash $0)"
+    exit 1
+  fi
+}
+log() { echo -e "\n==> $*\n"; }
+
+require_root
+export DEBIAN_FRONTEND=noninteractive
+
+#----- Update base system -----#
+log "Updating package lists and upgrading the system..."
+apt-get update -y
+apt-get -o Dpkg::Options::="--force-confnew" full-upgrade -y
+
+#----- Recommended tools -----#
+log "Installing base utilities..."
+apt-get install -y curl wget ca-certificates gnupg apt-transport-https software-properties-common locales keyboard-configuration console-setup sudo
+
+#----- Locale & Spanish language -----#
+log "Configuring Spanish locales..."
+# Ensure required locales are enabled
+if ! grep -qE '^(es_CL.UTF-8|es_ES.UTF-8)' /etc/locale.gen; then
+  sed -i 's/^# *\(es_ES.UTF-8\)/\1/' /etc/locale.gen || true
+  grep -q '^es_CL.UTF-8 UTF-8' /etc/locale.gen || echo "es_CL.UTF-8 UTF-8" >> /etc/locale.gen
+fi
+locale-gen
+
+# Preferred: Chilean Spanish; fallback: Spain Spanish
+DEFAULT_LOCALE="es_CL.UTF-8"
+if ! locale -a | grep -qi "^${DEFAULT_LOCALE,,}$"; then
+  DEFAULT_LOCALE="es_ES.UTF-8"
+fi
+# LANGUAGE sets priority for translations
+update-locale LANG="$DEFAULT_LOCALE" LANGUAGE="es_CL:es_ES:en_US"
+
+# Desktop Spanish tasks (optional; ignore if missing)
+log "Installing Spanish desktop language task (if available)..."
+apt-get install -y tasksel || true
+apt-cache show task-spanish-desktop >/dev/null 2>&1 && apt-get install -y task-spanish-desktop || true
+
+# KDE/Plasma Spanish translations
+log "Installing KDE/Plasma Spanish translations..."
+apt-get install -y plasma-workspace-l10n kde-config-cron kde-config-systemd
+
+#----- Keyboard: Spanish Latin American (latam) -----#
+log "Setting keyboard layout to Spanish Latin American (latam) for console..."
+# Configure /etc/default/keyboard (used by console and as base for DEs)
+if [ -f /etc/default/keyboard ]; then
+  sed -i 's/^XKBLAYOUT=.*/XKBLAYOUT="latam"/' /etc/default/keyboard || true
+  if grep -q '^XKBVARIANT=' /etc/default/keyboard; then
+    sed -i 's/^XKBVARIANT=.*/XKBVARIANT=""/' /etc/default/keyboard || true
+  else
+    echo 'XKBVARIANT=""' >> /etc/default/keyboard
+  fi
+else
+  cat >/etc/default/keyboard <<'KBEOF'
+XKBMODEL="pc105"
+XKBLAYOUT="latam"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+KBEOF
+fi
+# Apply to console now
+setupcon || true
+
+# NOTE: We intentionally avoid setting X11-specific keymaps; Wayland session will handle layout via this base config and KDE settings.
+
+#----- KDE Plasma Desktop (Wayland-first) -----#
+log "Installing KDE Plasma (standard) and SDDM display manager with Wayland defaults..."
+apt-get install -y kde-standard sddm
+# Ensure Wayland components are present
+apt-get install -y plasma-workspace-wayland kwin-wayland xwayland
+
+# Set SDDM to use Wayland as display server
+install -d /etc/sddm.conf.d
+cat >/etc/sddm.conf.d/10-wayland.conf <<'SDDMEOF'
+[General]
+DisplayServer=wayland
+
+[Wayland]
+CompositorCommand=kwin_wayland
+EnableHiDPI=true
+SDDMEOF
+
+# Prefer Plasma Wayland session name for autologin/default selection (if autologin is configured later)
+# (This does not enable autologin; it only sets the session name used if enabled elsewhere.)
+cat >/etc/sddm.conf.d/20-session.conf <<'SESSCONF'
+[Autologin]
+Session=plasmawayland.desktop
+SESSCONF
+
+# Make SDDM the default display manager
+echo "sddm shared/default-x-display-manager select sddm" | debconf-set-selections || true
+dpkg-reconfigure -f noninteractive sddm || true
+
+#----- LibreOffice (Spanish) -----#
+log "Installing LibreOffice with Spanish help and l10n..."
+apt-get install -y libreoffice libreoffice-help-es libreoffice-l10n-es hunspell-es
+
+#----- Synaptic & System Tools -----#
+log "Installing Synaptic, FileZilla, Remmina(+plugins), VLC, htop, btop..."
+apt-get install -y synaptic filezilla remmina remmina-plugin-rdp remmina-plugin-vnc vlc htop btop
+
+#----- Brave Browser (official repo) -----#
+log "Installing Brave Browser from official repo..."
+ARCH="$(dpkg --print-architecture)"
+install -d -m 0755 /usr/share/keyrings
+curl -fsSLo /usr/share/keyrings/brave-browser-archive-keyring.gpg https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
+
+cat >/etc/apt/sources.list.d/brave-browser-release.list <<EOF
+deb [signed-by=/usr/share/keyrings/brave-browser-archive-keyring.gpg arch=${ARCH}] https://brave-browser-apt-release.s3.brave.com/ stable main
+EOF
+
+apt-get update -y
+apt-get install -y brave-browser
+
+#----- Users: set root password and create 'live' user -----#
+log "Configuring users and passwords (root & live)..."
+# Set root password to 'root'
+echo "root:root" | chpasswd
+
+# Create user 'live' with password 'live' and sudo if not exists
+if ! id -u live >/dev/null 2>&1; then
+  useradd -m -s /bin/bash -G sudo live
+  echo "live:live" | chpasswd
+  # Optional: passwordless sudo (commented out by default for security)
+  # echo 'live ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-live-nopasswd
+  # chmod 0440 /etc/sudoers.d/90-live-nopasswd
+fi
+
+#----- Branding: "Hadassa OS" (safe changes) -----#
+# 1) Hostname (machine name)
+log "Branding system as 'Hadassa OS' (hostname + banners)..."
+NEW_HOSTNAME="hadassa-os"
+hostnamectl set-hostname "$NEW_HOSTNAME"
+echo "$NEW_HOSTNAME" >/etc/hostname
+
+# 2) Login and MOTD banners
+cat >/etc/issue <<'ISSUEEOF'
+Hadassa OS \n \l
+ISSUEEOF
+
+cat >/etc/motd <<'MOTDEOF'
+Bienvenido a Hadassa OS
+MOTDEOF
+
+# 3) GRUB menu label (optional cosmetic)
+if grep -q '^GRUB_DISTRIBUTOR=' /etc/default/grub; then
+  sed -i 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="Hadassa OS"/' /etc/default/grub
+else
+  echo 'GRUB_DISTRIBUTOR="Hadassa OS"' >> /etc/default/grub
+fi
+if command -v update-grub >/dev/null 2>&1; then
+  update-grub || true
+fi
+
+#----- Final clean up & info -----#
+log "Cleaning up..."
+apt-get autoremove -y
+apt-get autoclean -y
+
+log "All done!"
+echo "Default system language set to: $DEFAULT_LOCALE"
+echo "Keyboard layout set to: latam"
+echo "Hostname set to: ${NEW_HOSTNAME} (Hadassa OS branding applied)"
+echo "Wayland is the default display server (SDDM). Session hint: plasmawayland.desktop"
+echo "User 'root' password set to: root (change ASAP)"
+echo "User 'live' created with sudo, password: live (change ASAP)"
+echo "Reboot to start the Wayland session."
+read -r -p "Reboot now [y/N]: " ans || true
+if [[ "${ans,,}" == "y" ]]; then
+  systemctl reboot
+else
+  echo "You can reboot later with: sudo reboot"
+fi
