@@ -12,7 +12,7 @@ require_root
 
 log "Instalando KDE Plasma estándar y SDDM..."
 apt-get install -y kde-standard sddm
-apt-get install -y plasma-workspace-wayland kwin-wayland xwayland
+apt-get install -y plasma-workspace kwin-wayland xwayland
 
 log "Forzando Wayland por defecto en SDDM..."
 install -d /etc/sddm.conf.d
